@@ -1,6 +1,6 @@
 # p2pshare — Secure P2P File Sharing
 
-Fully spec-compliant implementation of CISC468 P2P file sharing protocol.
+A peer-to-peer encrypted file-sharing tool built for CISC 468. Supports mDNS discovery, mutal authentication, encrypted transfers, offline relay and key rotation. Designed to interoperate with the Go reference client via a shared protocol spec.
 
 ## Installation
 
@@ -59,11 +59,8 @@ Signed types: `HELLO`, `CONTACT_REQUEST`, `CONTACT_ACCEPT`, `HANDSHAKE_INIT`, `H
 | Feature | Algorithm |
 |---|---|
 | Identity keys | Ed25519 |
-| Key exchange | X25519 ephemeral ECDH |
 | Session key derivation | HKDF-SHA256, 4 labels: TX/RX/NTX/NRX |
 | Transport encryption | AES-256-GCM (chunk-level) |
-| File encryption at rest | AES-256-GCM |
-| Contact encryption at rest | AES-256-GCM |
 | Password KDF | Argon2id (time=3, mem=64MB, threads=4) |
 | File integrity | SHA-256 + Ed25519 manifest signature |
 
@@ -128,13 +125,3 @@ files/<id>.meta       JSON { nonce, filename, sha256_hex, size, ... }
 storage.salt          32-byte salt for storage key derivation
 file_list_cache/      Cached peer file lists for proxy download
 ```
-
-## Security Properties
-
-1. **Mutual authentication** — Ed25519 signatures on all handshake messages + CONTACT_REQUEST/ACCEPT; fingerprint = `hex(sha256(pubkey))` verified at key exchange
-2. **Perfect Forward Secrecy** — fresh X25519 keypair per session; session keys via HKDF; compromise of long-term Ed25519 key cannot decrypt past sessions
-3. **File integrity** — SHA-256 checked on receipt; Ed25519 manifest signature verified against original owner's key (works even through proxy peers)
-4. **Chunk-level authentication** — each 512 KB chunk is AES-256-GCM encrypted with AAD binding it to `file_id:chunk_index:total_chunks:message_id`; replay/reorder attacks caught
-5. **At-rest encryption** — received files and contacts stored AES-256-GCM encrypted; identity key Argon2id-password-protected
-6. **Key rotation** — old key signs the rotation notice; contacts verify, mark old key revoked, add new key (unverified); user must re-verify out-of-band
-7. **Proxy downloads** — original owner's Ed25519 manifest signature travels with the file and is verified regardless of which peer serves it
