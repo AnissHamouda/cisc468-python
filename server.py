@@ -1,373 +1,334 @@
 """
-P2P Share Server.
-
-Listens for incoming connections, performs handshakes, and handles:
-  - LIST_FILES
-  - REQUEST_FILE (with consent prompt)
-  - SEND_FILE    (with consent prompt)
-  - NOTIFY_KEY_ROTATION
-  - PING
+server.py — TLS 1.3 TCP server for p2pshare.
 """
 
 import os
+import ssl
 import json
+import math
 import socket
-import threading
 import hashlib
 import logging
+import threading
 from typing import Optional, Callable
 
-from .crypto import (
-    Identity, FileKeyStore,
-    fingerprint as fp_of,
-    decode_b64, encode_b64,
-    sha256_hex,
-    encrypt_file, decrypt_file,
+from crypto_utils import Identity, SessionKeys, encrypt_chunk, b64e, b64d, CHUNK_SIZE
+from protocol import (
+    build_envelope, verify_envelope, send_frame, recv_frame,
+    canonical_manifest,
+    MSG_HELLO, MSG_CONTACT_REQUEST, MSG_CONTACT_ACCEPT,
+    MSG_HANDSHAKE_INIT,
+    MSG_LIST_FILES_REQUEST, MSG_LIST_FILES_RESPONSE,
+    MSG_FILE_REQUEST, MSG_FILE_APPROVE, MSG_FILE_DENY,
+    MSG_TRANSFER_START, MSG_CHUNK, MSG_TRANSFER_DONE,
+    MSG_KEY_ROTATE_NOTICE, MSG_ERROR,
 )
-from cryptography.exceptions import InvalidTag
-from .contacts import ContactStore, Contact
-from .share_index import ShareIndex, PeerFileCache, SharedFile, file_sha256
-from .session import perform_handshake_responder, Session, SessionError
-from .protocol import *
+from handshake import perform_handshake_responder, HandshakeError
+from storage import ContactStore, ShareIndex, Contact, SharedFile
+from tls_utils import make_server_ssl_context
+from crypto_utils import fingerprint_from_bytes
 
 log = logging.getLogger(__name__)
 
 
 class Server:
-    def __init__(
-        self,
-        identity: Identity,
-        contacts: ContactStore,
-        share_index: ShareIndex,
-        peer_cache: PeerFileCache,
-        file_key_store: FileKeyStore,
-        received_dir: str,
-        port: int = 0,
-        consent_callback: Optional[Callable] = None,
-    ):
+    def __init__(self, identity, contacts, share_index, data_dir,
+                 port=0, consent_cb=None):
         self.identity = identity
         self.contacts = contacts
         self.share_index = share_index
-        self.peer_cache = peer_cache
-        self.file_key_store = file_key_store
-        self.received_dir = received_dir
-        self._consent_callback = consent_callback or self._default_consent
+        self.data_dir = data_dir
         self._port = port
-        self._sock: Optional[socket.socket] = None
+        self._consent_cb = consent_cb or self._default_consent
+        self._sock = None
+        self._ssl_ctx = None
+        self._cert_path = None
+        self._key_path = None
         self._running = False
+        self._actual_port = port
 
     @property
-    def port(self) -> int:
-        return self._port
+    def port(self):
+        return self._actual_port
 
-    def start(self) -> int:
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(("0.0.0.0", self._port))
-        self._sock.listen(16)
-        self._port = self._sock.getsockname()[1]
+    def start(self):
+        ctx, cert_path, key_path = make_server_ssl_context(self.identity)
+        self._ssl_ctx = ctx
+        self._cert_path = cert_path
+        self._key_path = key_path
+        raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        raw.bind(("0.0.0.0", self._port))
+        raw.listen(32)
+        self._actual_port = raw.getsockname()[1]
+        self._sock = raw
         self._running = True
-        t = threading.Thread(target=self._accept_loop, daemon=True)
-        t.start()
-        return self._port
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+        return self._actual_port
 
     def stop(self):
         self._running = False
         if self._sock:
-            self._sock.close()
+            try: self._sock.close()
+            except: pass
+        for p in [self._cert_path, self._key_path]:
+            if p and os.path.exists(p):
+                try: os.unlink(p)
+                except: pass
 
     def _accept_loop(self):
         while self._running:
             try:
                 conn, addr = self._sock.accept()
-                t = threading.Thread(
-                    target=self._handle_connection,
-                    args=(conn, addr),
-                    daemon=True,
-                )
-                t.start()
-            except Exception:
-                if self._running:
-                    log.exception("Accept error")
+                threading.Thread(target=self._handle_connection, args=(conn, addr), daemon=True).start()
+            except OSError:
+                break
 
-    def _handle_connection(self, conn: socket.socket, addr):
-        conn.settimeout(60.0)
-        log.debug("Incoming connection from %s", addr)
+    def _handle_connection(self, raw_conn, addr):
         try:
-            session = perform_handshake_responder(conn, self.identity)
-            peer_fp = fp_of(session.peer_pub_bytes)
-            log.debug("Session established with %s", peer_fp)
-            self._dispatch(session, peer_fp, addr)
-        except SessionError as e:
-            print(f"\n[SECURITY WARNING] {e}")
+            tls_conn = self._ssl_ctx.wrap_socket(raw_conn, server_side=True)
+            tls_conn.settimeout(120.0)
+            self._dispatch(tls_conn, addr)
+        except ssl.SSLError as e:
+            log.debug(f"TLS error from {addr}: {e}")
         except Exception as e:
-            log.debug("Connection error: %s", e)
+            log.debug(f"Handler error from {addr}: {e}")
         finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
+            try: raw_conn.close()
+            except: pass
 
-    def _dispatch(self, session: Session, peer_fp: str, addr):
-        while True:
-            try:
-                msg = session.recv()
-            except (ConnectionError, OSError):
-                break
-            except SessionError as e:
-                print(f"\n[SECURITY] {e}")
-                break
-
-            t = msg.get("type")
-            try:
-                if t == MSG_PING:
-                    session.send({"type": MSG_PONG})
-                elif t == MSG_LIST_FILES:
-                    self._handle_list_files(session)
-                elif t == MSG_REQUEST_FILE:
-                    self._handle_request_file(session, msg, peer_fp)
-                elif t == MSG_SEND_FILE:
-                    self._handle_receive_file(session, msg, peer_fp, addr)
-                elif t == MSG_NOTIFY_KEY_ROTATE:
-                    self._handle_key_rotation(msg, peer_fp)
-                    break
-                else:
-                    session.send({"type": MSG_ERROR, "message": "Unknown message type"})
-            except (ConnectionError, OSError):
-                break
-            except SessionError as e:
-                print(f"\n[SECURITY] {e}")
-                session.send({"type": MSG_ERROR, "message": str(e)})
-                break
-            except Exception as e:
-                log.exception("Dispatch error")
-                try:
-                    session.send({"type": MSG_ERROR, "message": f"Internal error: {e}"})
-                except Exception:
-                    break
-
-    # -----------------------------------------------------------------------
-    # Handlers
-    # -----------------------------------------------------------------------
-
-    def _handle_list_files(self, session: Session):
-        files = self.share_index.public_list()
-        session.send({"type": MSG_FILE_LIST, "files": files})
-
-    def _handle_request_file(self, session: Session, msg: dict, peer_fp: str):
-        filename = msg.get("filename", "")
-        contact = self.contacts.get(peer_fp)
-        contact_name = contact.alias or peer_fp[:16] if contact else peer_fp[:16]
-
-        # Consent prompt
-        prompt = f"\n[REQUEST] {contact_name} wants to download '{filename}'. Allow? [y/N]: "
-        if not self._consent_callback(prompt):
-            session.send({"type": MSG_REJECT, "message": "Peer declined the request."})
-            return
-
-        sf = self.share_index.get(filename)
-        if sf is None:
-            session.send({"type": MSG_ERROR, "message": f"File '{filename}' is not available."})
-            return
-
-        if not os.path.exists(sf.path):
-            session.send({"type": MSG_ERROR, "message": f"File '{filename}' is no longer available on disk."})
-            return
-
-        # Read file — decrypt if it was previously received and stored encrypted
-        with open(sf.path, "rb") as f:
-            raw = f.read()
-
-        file_key = self.file_key_store.get(filename)
-        if file_key is not None:
-            try:
-                raw = decrypt_file(file_key, raw)
-            except Exception:
-                pass  # Not encrypted (original shared file), use as-is
-
-        session.send({"type": MSG_CONSENT})
-        self._stream_file(session, sf, raw)
-
-    def _handle_receive_file(self, session: Session, msg: dict, peer_fp: str, addr):
-        """Peer is pushing a file to us. Ask for consent first."""
-        filename = msg.get("filename", "unknown")
-        size = msg.get("size", 0)
-        sha = msg.get("sha256", "")
-        contact = self.contacts.get(peer_fp)
-        contact_name = contact.alias or peer_fp[:16] if contact else peer_fp[:16]
-
-        prompt = (
-            f"\n[INCOMING] {contact_name} wants to send you '{filename}' "
-            f"({size} bytes). Accept? [y/N]: "
-        )
-        if not self._consent_callback(prompt):
-            session.send({"type": MSG_REJECT, "message": "Recipient declined."})
-            return
-
-        session.send({"type": MSG_CONSENT})
-        self._recv_file_data(session, peer_fp, filename, sha, msg.get("signature", ""), msg.get("owner_fp", peer_fp))
-
-    def _handle_key_rotation(self, msg: dict, old_fp: str):
-        """
-        Peer is rotating their key. Update our contact store.
-        The new key must be signed by the old key.
-        """
-        new_pub_b64 = msg.get("new_identity_pub", "")
-        signature_b64 = msg.get("signature", "")
+    def _dispatch(self, sock, addr):
         try:
-            new_pub = decode_b64(new_pub_b64)
-            sig = decode_b64(signature_b64)
+            env = recv_frame(sock)
+        except Exception as e:
+            log.debug(f"Failed to read first frame from {addr}: {e}")
+            return
+
+        msg_type = env.get("type", "")
+        peer_fp  = env.get("from", "")
+
+        if msg_type == MSG_HELLO:
+            self._handle_hello(sock, env, addr)
+        elif msg_type == MSG_CONTACT_REQUEST:
+            self._handle_contact_request(sock, env, addr)
+        elif msg_type == MSG_KEY_ROTATE_NOTICE:
+            contact = self.contacts.get(peer_fp)
+            if contact is None:
+                self._send_error(sock, f"Unknown peer: {peer_fp[:16]}")
+                return
+            self._handle_key_rotate(sock, env, contact)
+        elif msg_type == MSG_LIST_FILES_REQUEST:
+            contact = self.contacts.get(peer_fp)
+            if contact is None:
+                self._send_error(sock, f"Unknown peer: {peer_fp[:16]}")
+                return
+            if contact.revoked:
+                self._send_error(sock, "[SECURITY] Your key has been marked revoked")
+                return
+            self._handle_list_files(sock, env, contact)
+        elif msg_type == MSG_HANDSHAKE_INIT:
+            contact = self.contacts.get(peer_fp)
+            if contact is None:
+                self._send_error(sock, f"Unknown peer: {peer_fp[:16]}")
+                return
+            if contact.revoked:
+                self._send_error(sock, "[SECURITY] Your key has been marked revoked")
+                return
+            self._handle_file_session(sock, env, contact)
+        else:
+            self._send_error(sock, f"Unexpected message type: {msg_type}")
+
+    def _handle_hello(self, sock, env, addr):
+        reply = build_envelope(self.identity, MSG_HELLO, {
+            "raw_pub": b64e(self.identity.raw_public_key),
+            "port": self._actual_port,
+        })
+        send_frame(sock, reply)
+
+    def _handle_contact_request(self, sock, env, addr):
+        payload  = env.get("payload", {})
+        peer_fp  = env.get("from", "")
+        raw_pub_b64 = payload.get("raw_pub", "")
+        peer_port   = payload.get("port", 0)
+
+        try:
+            raw_pub = b64d(raw_pub_b64)
         except Exception:
-            print(f"\n[SECURITY] Received malformed key rotation notice from {old_fp}.")
+            self._send_error(sock, "Invalid raw_pub")
             return
 
-        old_contact = self.contacts.get(old_fp)
-        if old_contact is None:
-            print(f"\n[WARNING] Received key rotation notice from unknown peer {old_fp}. Ignoring.")
+        if not verify_envelope(env, raw_pub):
+            self._send_error(sock, "[SECURITY] CONTACT_REQUEST signature invalid")
+            print(f"\n[SECURITY] CONTACT_REQUEST from {peer_fp[:16]} failed sig check")
             return
 
-        # Verify: new key announcement signed by the old key
-        payload = b"key-rotation:" + new_pub
-        if not Identity.verify_signature(old_contact.pub_bytes, sig, payload):
-            print(f"\n[SECURITY] Key rotation signature from {old_fp} is INVALID. Ignoring.")
+        peer_host = addr[0]
+        existing = self.contacts.get(peer_fp)
+        if existing is None:
+            contact = Contact(
+                fingerprint=peer_fp, raw_pub=raw_pub_b64,
+                host=peer_host, port=peer_port, verified=False,
+            )
+            self.contacts.add(contact)
+            print(f"\n[NEW CONTACT] {peer_fp}")
+            print(f"  Address : {peer_host}:{peer_port}")
+            print(f"  Verify  : verify-contact {peer_fp}")
+        else:
+            self.contacts.update_address(peer_fp, peer_host, peer_port)
+
+        reply = build_envelope(self.identity, MSG_CONTACT_ACCEPT, {
+            "raw_pub": b64e(self.identity.raw_public_key),
+            "port": self._actual_port,
+        })
+        send_frame(sock, reply)
+
+    def _handle_list_files(self, sock, env, contact):
+        if not verify_envelope(env, contact.raw_pub_bytes()):
+            self._send_error(sock, "[SECURITY] LIST_FILES_REQUEST signature invalid")
+            return
+        files = self.share_index.public_list()
+        send_frame(sock, build_envelope(self.identity, MSG_LIST_FILES_RESPONSE, {"files": files}))
+
+    def _handle_file_session(self, sock, env, contact):
+        try:
+            session = perform_handshake_responder(
+                sock, self.identity,
+                contact.fingerprint, contact.raw_pub_bytes(),
+                prefetched_env=env,
+            )
+        except HandshakeError as e:
+            print(f"\n[SECURITY] Handshake failed: {e}")
             return
 
-        new_fp = fp_of(new_pub)
-        # Mark old key as revoked, add new contact
-        self.contacts.mark_revoked(old_fp, successor_fp=new_fp)
-        new_contact = Contact(
-            pub_bytes=new_pub,
-            host=old_contact.host,
-            port=old_contact.port,
-            alias=old_contact.alias,
-            verified=False,  # must re-verify
-            revoked=False,
+        try:
+            req_env = recv_frame(sock)
+        except Exception as e:
+            log.debug(f"Post-handshake read failed: {e}")
+            return
+
+        if req_env.get("type") != MSG_FILE_REQUEST:
+            self._send_error(sock, f"Expected FILE_REQUEST, got {req_env.get('type')}")
+            return
+
+        file_id = req_env["payload"].get("file_id", "")
+        sf = self.share_index.get(file_id)
+        if sf is None:
+            send_frame(sock, build_envelope(self.identity, MSG_FILE_DENY, {
+                "file_id": file_id, "reason": "File not found in share index",
+            }))
+            print(f"\n[ERROR] Peer requested unknown file_id: {file_id}")
+            return
+
+        peer_name = contact.alias or contact.fingerprint[:16]
+        if not self._consent_cb(contact.fingerprint, peer_name, sf.filename):
+            send_frame(sock, build_envelope(self.identity, MSG_FILE_DENY, {
+                "file_id": file_id, "reason": "Denied by user",
+            }))
+            print(f"\n[INFO] File request for '{sf.filename}' denied")
+            return
+
+        send_frame(sock, build_envelope(self.identity, MSG_FILE_APPROVE, {"file_id": file_id}))
+        self._send_file(sock, session, sf)
+
+    def _send_file(self, sock, session, sf):
+        # Read the file — could be an original shared file (plaintext path) 
+        # or a previously received file (encrypted in received store)
+        try:
+            if os.path.exists(sf.path):
+                with open(sf.path, "rb") as f:
+                    data = f.read()
+            else:
+                self._send_error(sock, f"File not found on disk: {sf.filename}")
+                print(f"\n[ERROR] File missing from disk: {sf.path}")
+                return
+        except OSError as e:
+            self._send_error(sock, f"Cannot read file: {e}")
+            print(f"\n[ERROR] Cannot read '{sf.filename}': {e}")
+            return
+
+        import uuid as _uuid
+        transfer_id = str(_uuid.uuid4())
+        total_chunks = max(1, math.ceil(len(data) / CHUNK_SIZE))
+
+        start_payload = {
+            "file_id": sf.file_id, "filename": sf.filename,
+            "sha256_hex": sf.sha256_hex, "size": sf.size,
+            "total_chunks": total_chunks,
+            "original_owner": sf.original_owner,
+            "manifest_sig": sf.manifest_sig,
+            "timestamp": sf.timestamp,
+        }
+        send_frame(sock, build_envelope(self.identity, MSG_TRANSFER_START,
+                                        start_payload, msg_id=transfer_id))
+
+        for idx in range(total_chunks):
+            chunk = data[idx * CHUNK_SIZE:(idx + 1) * CHUNK_SIZE]
+            ct = encrypt_chunk(
+                session.tx_key, session.tx_nonce_base, idx, chunk,
+                sf.file_id, total_chunks, transfer_id,
+            )
+            send_frame(sock, build_envelope(self.identity, MSG_CHUNK, {
+                "file_id": sf.file_id, "chunk_index": idx,
+                "total_chunks": total_chunks,
+                "data": b64e(ct), "transfer_id": transfer_id,
+            }))
+
+        send_frame(sock, build_envelope(self.identity, MSG_TRANSFER_DONE, {
+            "file_id": sf.file_id, "transfer_id": transfer_id,
+            "sha256_hex": sf.sha256_hex,
+        }))
+        print(f"\n[OK] Sent '{sf.filename}' ({sf.size} bytes)")
+
+    def _handle_key_rotate(self, sock, env, contact):
+        if not verify_envelope(env, contact.raw_pub_bytes()):
+            self._send_error(sock, "[SECURITY] KEY_ROTATE_NOTICE signature invalid")
+            print(f"\n[SECURITY] KEY_ROTATE_NOTICE from {contact.fingerprint[:16]} failed verification")
+            return
+
+        payload     = env["payload"]
+        new_fp      = payload.get("new_fingerprint", "")
+        new_raw_b64 = payload.get("new_raw_pub", "")
+        try:
+            new_raw = b64d(new_raw_b64)
+        except Exception:
+            self._send_error(sock, "Invalid new_raw_pub")
+            return
+
+        computed = fingerprint_from_bytes(new_raw)
+        if computed != new_fp:
+            self._send_error(sock, "[SECURITY] New fingerprint doesn't match new public key")
+            print(f"\n[SECURITY] KEY_ROTATE_NOTICE: fingerprint/key mismatch from {contact.fingerprint[:16]}")
+            return
+
+        self.contacts.mark_revoked(contact.fingerprint, successor_fp=new_fp)
+        from storage import Contact as C
+        new_contact = C(
+            fingerprint=new_fp, raw_pub=new_raw_b64,
+            host=contact.host, port=contact.port,
+            alias=contact.alias, verified=False,
         )
         self.contacts.add(new_contact)
+        send_frame(sock, build_envelope(self.identity, MSG_CONTACT_ACCEPT, {
+            "raw_pub": b64e(self.identity.raw_public_key),
+            "port": self._actual_port,
+        }))
         print(
-            f"\n[KEY ROTATION] Contact '{old_contact.alias or old_fp[:16]}' has rotated their key.\n"
-            f"  Old fingerprint: {old_fp}\n"
-            f"  New fingerprint: {new_fp}\n"
-            f"  *** You must re-verify this contact: verify-contact {new_fp} ***"
+            f"\n[KEY ROTATION] {contact.alias or contact.fingerprint[:16]} rotated their key\n"
+            f"  Old : {contact.fingerprint}\n"
+            f"  New : {new_fp}\n"
+            f"  *** Re-verify: verify-contact {new_fp} ***"
         )
 
-    # -----------------------------------------------------------------------
-    # File streaming helpers
-    # -----------------------------------------------------------------------
-
-    def _stream_file(self, session: Session, sf: SharedFile, raw: bytes):
-        """Send file in encrypted chunks."""
-        total = len(raw)
-        offset = 0
-        chunk_idx = 0
-        while offset < total:
-            chunk = raw[offset:offset + CHUNK_SIZE]
-            is_last = (offset + len(chunk)) >= total
-            envelope = json.dumps({
-                "type": MSG_FILE_DATA,
-                "filename": sf.filename,
-                "sha256": sf.sha256,
-                "signature": sf.signature,
-                "owner_fp": sf.owner_fp,
-                "chunk_index": chunk_idx,
-                "offset": offset,
-                "total_size": total,
-                "last": is_last,
-                "data": list(chunk),
-            }).encode()
-            session.send_raw_encrypted(envelope)
-            offset += len(chunk)
-            chunk_idx += 1
-
-    def _recv_file_data(
-        self,
-        session: Session,
-        sender_fp: str,
-        filename: str,
-        expected_sha: str,
-        signature_b64: str,
-        owner_fp: str,
-    ):
-        """Receive streamed file chunks, verify integrity, and save encrypted."""
-        buf = b""
-        total_size = None
-        while True:
-            raw = session.recv_raw_encrypted()
-            env = json.loads(raw)
-            if env.get("type") == MSG_ERROR:
-                print(f"\n[ERROR] File transfer failed: {env.get('message', 'unknown error')}")
-                return
-            if env.get("type") != MSG_FILE_DATA:
-                print(f"\n[ERROR] Unexpected message during file transfer.")
-                return
-
-            chunk = bytes(env["data"])
-            buf += chunk
-            if total_size is None:
-                total_size = env["total_size"]
-                actual_sha = env["sha256"]
-                actual_sig = env["signature"]
-                actual_owner_fp = env["owner_fp"]
-
-            if env.get("last"):
-                break
-
-        # Verify hash
-        computed_sha = hashlib.sha256(buf).hexdigest()
-        if computed_sha != actual_sha:
-            print(
-                f"\n[SECURITY] File '{filename}' FAILED integrity check!\n"
-                f"  Expected SHA-256: {actual_sha}\n"
-                f"  Computed SHA-256: {computed_sha}\n"
-                f"  The file may have been tampered with in transit. DISCARDING."
-            )
-            return
-
-        # Verify origin signature (works even if downloaded from a proxy peer)
-        owner_contact = self.contacts.get(actual_owner_fp)
-        if owner_contact is None:
-            print(
-                f"\n[SECURITY] Cannot verify file '{filename}': origin peer {actual_owner_fp} is unknown.\n"
-                f"  Add the origin peer as a contact before downloading their files."
-            )
-            return
-
-        sig_payload = f"file:{filename}:{actual_sha}".encode()
+    def _send_error(self, sock, message):
         try:
-            sig_bytes = decode_b64(actual_sig)
+            send_frame(sock, build_envelope(self.identity, MSG_ERROR, {"message": message}))
         except Exception:
-            print(f"\n[SECURITY] File '{filename}' has invalid signature encoding. DISCARDING.")
-            return
-
-        if not Identity.verify_signature(owner_contact.pub_bytes, sig_bytes, sig_payload):
-            print(
-                f"\n[SECURITY] File '{filename}' signature verification FAILED!\n"
-                f"  The file was NOT signed by {actual_owner_fp}.\n"
-                f"  Possible tampering detected. DISCARDING."
-            )
-            return
-
-        # Encrypt and save
-        file_key = self.file_key_store.get_or_create(filename)
-        encrypted = encrypt_file(file_key, buf)
-        out_path = os.path.join(self.received_dir, filename)
-        with open(out_path, "wb") as f:
-            f.write(encrypted)
-        os.chmod(out_path, 0o600)
-
-        print(
-            f"\n[OK] Received and verified '{filename}' ({len(buf)} bytes).\n"
-            f"     Saved (encrypted) to: {out_path}"
-        )
-
-    # -----------------------------------------------------------------------
-    # Consent callback
-    # -----------------------------------------------------------------------
+            pass
 
     @staticmethod
-    def _default_consent(prompt: str) -> bool:
+    def _default_consent(peer_fp, peer_name, filename):
         try:
-            ans = input(prompt).strip().lower()
-            return ans == "y"
+            ans = input(f"\n[REQUEST] {peer_name} wants '{filename}'. Allow? [y/N]: ")
+            return ans.strip().lower() == "y"
         except EOFError:
             return False

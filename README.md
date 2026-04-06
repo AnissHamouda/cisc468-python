@@ -1,191 +1,140 @@
-# P2P Share — Secure Peer-to-Peer File Sharing
+# p2pshare — Secure P2P File Sharing
 
-A command-line P2P file sharing application built with security at every layer.
-
----
-
-## Features
-
-| Feature | Implementation |
-|---|---|
-| Peer discovery | mDNS via `python-zeroconf` |
-| Mutual authentication | Ed25519 signed handshake (TOFU + manual verification) |
-| Consent for transfers | Interactive prompts before any file is sent or received |
-| File listing (no consent) | `LIST_FILES` message, no consent required |
-| Offline proxy downloads | Peer cache + origin signature verification |
-| Key rotation | New key signed by old key, all contacts notified |
-| Confidentiality & integrity | ChaCha20-Poly1305 (transport) + AES-256-GCM (storage) |
-| Perfect Forward Secrecy | Ephemeral X25519 ECDH per session, HKDF-derived keys |
-| Secure local storage | Files encrypted with per-file AES-256-GCM keys |
-| Error reporting | Descriptive messages for all error and security events |
-
----
+Fully spec-compliant implementation of CISC468 P2P file sharing protocol.
 
 ## Installation
 
 ```bash
-cd p2p_share
-pip install -r requirements.txt
+pip install cryptography zeroconf
+python p2pshare.py --help
 ```
-
----
-
-## Quick Start
-
-### On Machine A
-```bash
-# Start the server
-python main.py serve
-
-# Share a file
-python main.py share ~/Documents/report.pdf
-```
-
-### On Machine B
-```bash
-# Discover peers on the LAN
-python main.py discover
-
-# Add Machine A as a contact
-python main.py add-contact 192.168.1.10:PORT
-
-# Verify the contact fingerprint (out-of-band, e.g. in person)
-python main.py verify-contact AA:BB:CC:DD:...
-
-# List files A is sharing
-python main.py list-files AA:BB:CC:DD:...
-
-# Request a file
-python main.py request AA:BB:CC:DD:... report.pdf
-
-# Send a file to A
-python main.py send AA:BB:CC:DD:... ~/photos/vacation.jpg
-```
-
----
 
 ## Commands
 
 | Command | Description |
 |---|---|
-| `serve` | Start the P2P server (listens + advertises via mDNS) |
-| `discover` | Scan the LAN for peers (5-second mDNS browse) |
-| `add-contact <host:port>` | Connect to a peer and exchange public keys |
-| `list-contacts` | Print all known contacts and their status |
-| `verify-contact <fingerprint>` | Mark a contact as verified after out-of-band confirmation |
-| `share <path>` | Add a file to your share index |
-| `list-files <fingerprint>` | List files available from a contact |
-| `request <fingerprint> <filename>` | Download a file from a contact |
-| `send <fingerprint> <path>` | Push a file to a contact |
-| `rotate-key` | Generate a new identity key and notify all contacts |
+| `serve [--port PORT]` | Start TLS 1.3 server + mDNS advertisement |
+| `discover` | Scan LAN for peers via mDNS (_cisc468._tcp) |
+| `add-contact host:port` | Exchange Ed25519 keys with a peer |
+| `list-contacts` | Print all contacts with status |
+| `verify-contact <fingerprint>` | Mark contact as verified (after out-of-band confirmation) |
+| `share <path>` | Sign and add file to share index |
+| `unshare <file_id>` | Remove file from share index |
+| `list-files host:port` | List peer's shared files (no consent) |
+| `request-file host:port <file_id>` | Download file (with PFS, integrity verify) |
+| `rotate-key` | Generate new key, notify all contacts |
 
----
+## Spec Compliance
 
-## Security Design
+### Protocol
 
-### Identity
+| Feature | Implementation |
+|---|---|
+| mDNS service type | `_cisc468._tcp.local.` |
+| Service name | First 16 hex chars of fingerprint |
+| TXT record | `fingerprint=<64-char hex>` |
+| Fingerprint | `hex(sha256(raw_ed25519_pubkey))` → 64 hex chars |
+| Frame format | `[4-byte big-endian uint32][UTF-8 JSON]`, max 4 MB |
+| Transport | TLS 1.3 via Python `ssl` module |
 
-Each user has a long-term **Ed25519** key pair. The 32-byte public key is hashed with SHA-256 to produce a human-readable colon-separated **fingerprint**:
+### Envelope format (sorted keys)
 
-```
-AA:BB:CC:DD:EE:FF:00:11
-```
-
-The fingerprint is used to identify contacts everywhere in the application.
-
-### Handshake (Mutual Authentication + PFS)
-
-Every TCP session uses a Noise-inspired handshake:
-
-1. **Initiator** sends `HELLO`: ephemeral X25519 public key + Ed25519 public key + Ed25519 signature over `(my_eph_pub || zeros || "hello")`
-2. **Responder** sends `HELLO_REPLY`: same structure, with the initiator's ephemeral pub bound into the signature
-3. Both sides perform **X25519 ECDH** on the ephemeral keys
-4. Session keys are derived via **HKDF-SHA256**, binding both identity public keys into the info field
-5. All further messages are encrypted with **ChaCha20-Poly1305**
-
-Because session keys are derived from **ephemeral** key material, compromise of a long-term Ed25519 key does not allow decryption of past sessions (**Perfect Forward Secrecy**).
-
-### File Integrity (including proxy downloads)
-
-When a file is added to the share index:
-- Its **SHA-256** hash is computed
-- The owner signs `"file:<filename>:<sha256>"` with their Ed25519 key
-
-When a file is received (whether directly or via a proxy):
-1. The SHA-256 of the received bytes is recomputed and compared
-2. The Ed25519 signature is verified against the **origin owner's** public key
-
-This means even if you download through an untrusted third party, you can verify the file came untampered from the original owner.
-
-### Local Storage Encryption
-
-- Each file stored on disk is encrypted with a unique **AES-256-GCM** key
-- All per-file keys are stored in an encrypted key store, protected by a **master key** derived from the identity private key via HKDF
-- The identity private key is protected by a **password** (scrypt KDF → AES-256-GCM)
-- All sensitive files are stored with mode `0o600`
-
-### Key Rotation
-
-1. User runs `rotate-key`
-2. A new Ed25519 key pair is generated
-3. The rotation announcement (`"key-rotation:" + new_pub_bytes`) is signed by the **old** private key
-4. All online contacts are notified; they verify the announcement against the old key
-5. Contacts mark the old key as **REVOKED** and add the new key as **unverified**
-6. Contacts are prompted to re-verify the new fingerprint out-of-band
-
-### Trust Model
-
-Contact verification uses **TOFU (Trust On First Use)** with manual out-of-band confirmation:
-
-1. `add-contact` performs the handshake and stores the peer's public key
-2. The user is shown the fingerprint and instructed to verify it out-of-band
-3. `verify-contact` marks the contact as verified
-
-Unverified contacts can still exchange files, but a warning is shown. Revoked keys are rejected immediately.
-
----
-
-## Architecture
-
-```
-main.py
-└── p2p/
-    ├── config.py        — Data directories and paths
-    ├── crypto.py        — Ed25519, X25519, AES-GCM, ChaCha20, HKDF, scrypt
-    ├── contacts.py      — Contact store (JSON, encrypted at rest)
-    ├── share_index.py   — Share index + peer file cache
-    ├── protocol.py      — Wire protocol: message framing, type constants
-    ├── session.py       — Handshake, encrypted session layer
-    ├── server.py        — TCP server, request/consent handlers
-    ├── client.py        — Outbound connections, file transfer client
-    ├── discovery.py     — mDNS advertisement and discovery
-    └── cli.py           — Command-line interface
+```json
+{
+  "from": "<64-char fingerprint>",
+  "id": "<uuid>",
+  "payload": {},
+  "sig": "<base64 Ed25519>",
+  "type": "MESSAGE_TYPE",
+  "v": 1
+}
 ```
 
----
+Canonical for signing: `{"v":1,"type":"...","id":"...","from":"...","payload":{...}}`
 
-## Data Directory (`~/.p2p_share/`)
+Signed types: `HELLO`, `CONTACT_REQUEST`, `CONTACT_ACCEPT`, `HANDSHAKE_INIT`, `HANDSHAKE_RESP`, `KEY_ROTATE_NOTICE`, `TRANSFER_START`
+
+### Cryptography
+
+| Feature | Algorithm |
+|---|---|
+| Identity keys | Ed25519 |
+| Key exchange | X25519 ephemeral ECDH |
+| Session key derivation | HKDF-SHA256, 4 labels: TX/RX/NTX/NRX |
+| Transport encryption | AES-256-GCM (chunk-level) |
+| File encryption at rest | AES-256-GCM |
+| Contact encryption at rest | AES-256-GCM |
+| Password KDF | Argon2id (time=3, mem=64MB, threads=4) |
+| File integrity | SHA-256 + Ed25519 manifest signature |
+
+### HKDF labels (exact spec)
 
 ```
-~/.p2p_share/
-├── keys/
-│   ├── identity.json      # Encrypted Ed25519 private key (scrypt + AES-GCM)
-│   └── file_keys.bin      # Encrypted per-file key store (AES-GCM)
-├── shared/                # Files you are sharing (originals, read directly)
-├── received/              # Files you received (AES-256-GCM encrypted)
-├── contacts.json          # Contact store (fingerprint → public key + metadata)
-├── share_index.json       # Your share index (filename, sha256, signature)
-└── peer_cache.json        # Cached file lists from other peers
+salt      = initiator_nonce XOR responder_nonce
+info_base = "CISC468-SESSION-V1" + init_fp + resp_fp
+
+TX key   : info_base + "TX"   → 32 bytes  (init→resp)
+RX key   : info_base + "RX"   → 32 bytes  (resp→init)
+NTX base : info_base + "NTX"  → 12 bytes
+NRX base : info_base + "NRX"  → 12 bytes
 ```
 
-All files are stored with permissions `0o600`. Directory permissions are `0o700`.
+### Chunk nonce
 
----
+```
+chunk_nonce = nonce_base XOR pad_left(uint64_be(chunk_index), 12)
+XOR applied to last 8 bytes of 12-byte nonce_base
+```
 
-## Limitations & Future Work
+Chunk AAD: `"<file_id>:<chunk_index>:<total_chunks>:<message_id>"`
+Chunk size: 512 KB (524,288 bytes)
 
-- **No NAT traversal**: works on a local network. For internet use, add a relay or use a VPN.
-- **Single-threaded consent**: the server pauses all connections during a consent prompt. A production system would use non-blocking I/O.
-- **No alias management**: add an `alias-contact` command to name contacts.
-- **No resumable transfers**: large file transfers start over on failure.
-- **Argon2id** would be preferable over scrypt for password hashing (requires `argon2-cffi`).
+### Handshake transcript
+
+```
+"CISC468-HANDSHAKE-V1"
++ initiator_fp (64 hex chars)
++ responder_fp (64 hex chars)
++ initiator_ephemeral_x25519_pubkey (32 bytes)
++ responder_ephemeral_x25519_pubkey (32 bytes)
++ initiator_nonce (32 bytes)
++ responder_nonce (32 bytes)
++ 0x00000001 (protocol version uint32 big-endian)
+```
+
+### Manifest canonical JSON (alphabetically sorted keys)
+
+```json
+{
+  "file_id": "...",
+  "filename": "...",
+  "original_owner": "...",
+  "sha256_hex": "...",
+  "size": 12345,
+  "timestamp": "2025-01-01T00:00:00Z"
+}
+```
+
+### Storage layout (`~/.p2pshare/`)
+
+```
+identity.key          nonce || AES-GCM ciphertext of Ed25519 seed
+identity.key.meta     JSON { salt: b64, pubkey: b64 }
+contacts.json.enc     AES-GCM ciphertext of contacts JSON
+contacts.json.meta    JSON { nonce: b64 }
+share_index.json      Plaintext JSON { file_id → SharedFile }
+files/<id>.enc        AES-GCM ciphertext of received file
+files/<id>.meta       JSON { nonce, filename, sha256_hex, size, ... }
+storage.salt          32-byte salt for storage key derivation
+file_list_cache/      Cached peer file lists for proxy download
+```
+
+## Security Properties
+
+1. **Mutual authentication** — Ed25519 signatures on all handshake messages + CONTACT_REQUEST/ACCEPT; fingerprint = `hex(sha256(pubkey))` verified at key exchange
+2. **Perfect Forward Secrecy** — fresh X25519 keypair per session; session keys via HKDF; compromise of long-term Ed25519 key cannot decrypt past sessions
+3. **File integrity** — SHA-256 checked on receipt; Ed25519 manifest signature verified against original owner's key (works even through proxy peers)
+4. **Chunk-level authentication** — each 512 KB chunk is AES-256-GCM encrypted with AAD binding it to `file_id:chunk_index:total_chunks:message_id`; replay/reorder attacks caught
+5. **At-rest encryption** — received files and contacts stored AES-256-GCM encrypted; identity key Argon2id-password-protected
+6. **Key rotation** — old key signs the rotation notice; contacts verify, mark old key revoked, add new key (unverified); user must re-verify out-of-band
+7. **Proxy downloads** — original owner's Ed25519 manifest signature travels with the file and is verified regardless of which peer serves it
